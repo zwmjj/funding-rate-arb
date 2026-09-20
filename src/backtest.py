@@ -7,9 +7,13 @@ Strategy: long 1 unit spot + short 1 unit perpetual when 8h funding rate
 
 PnL components per 8h step while in a position:
   + funding income       = notional * fundingRate   (shorts receive positive funding)
-  - spot mark PnL        = notional * spot_return
-  + perp mark PnL        = notional * perp_return   (short leg, so sign flips)
-  => net price PnL       = notional * (perp_return - spot_return)   (basis drift)
+  + spot mark PnL        = notional * spot_return   (long leg)
+  - perp mark PnL        = notional * perp_return   (short leg, so the sign flips)
+  => net price PnL       = notional * (spot_return - perp_return)   (basis drift)
+
+(This block previously stated the price-PnL sign backwards on both the spot
+line and the net line. The implementation below was always correct; the
+docstring disagreed with it on the most basic identity in the strategy.)
      (in practice spot_return ≈ perp_return, so this is near zero)
 
 Costs:
@@ -59,7 +63,16 @@ def build_panel(asset: str) -> pd.DataFrame:
     spot = _load(f"{asset}_spot.csv")
     perp = _load(f"{asset}_perp.csv")
 
+    # Binance stamps funding settlements a few milliseconds off the hour
+    # (e.g. 2026-04-09 08:00:00.010+00:00). The spot/perp series are resampled
+    # onto an exact 8h grid, so an as-is concat aligns only the settlements that
+    # happen to land on the grid and .dropna() silently discards the rest --
+    # 3,051 of 6,872 BTC rows, 44% of the funding history, with no warning.
+    # Floor the settlement timestamps onto the same grid before joining.
     fr = fr.set_index("timestamp")["fundingRate"].astype(float)
+    fr.index = fr.index.floor("8h")
+    fr = fr[~fr.index.duplicated(keep="last")]
+
     spot_c = spot.set_index("timestamp")["close"].astype(float).resample("8h").ffill()
     perp_c = perp.set_index("timestamp")["close"].astype(float).resample("8h").ffill()
 
@@ -67,6 +80,15 @@ def build_panel(asset: str) -> pd.DataFrame:
         [fr.rename("funding"), spot_c.rename("spot"), perp_c.rename("perp")],
         axis=1,
     ).dropna()
+
+    # Fail loudly rather than backtesting on a fraction of the sample. A
+    # silent join loss is exactly the failure this guard exists to catch.
+    kept, total = len(df), len(fr)
+    if kept < 0.95 * total:
+        raise ValueError(
+            f"{asset}: joined panel keeps only {kept}/{total} funding settlements "
+            f"({kept / total:.1%}). Check timestamp alignment before trusting results."
+        )
     df["spot_ret"] = df["spot"].pct_change().fillna(0.0)
     df["perp_ret"] = df["perp"].pct_change().fillna(0.0)
     return df
